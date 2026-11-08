@@ -62,8 +62,10 @@ apxtool --device /dev/sg0 flash erase-sector 0x152000 --backup backup.bin --yes
 `flash read`/`write`/`erase-sector` refuse to overwrite existing files. `write` and
 `erase-sector` take a fresh full-chip backup first (it must be a new path), preserve
 the neighbouring bytes of every touched 4 KiB sector, skip sectors that already
-match, and verify each sector by readback. `flash` checks the JEDEC ID (`5E4015`,
-2 MiB) before doing anything else. The DDR pool is shared with the stock firmware,
+match, and verify each sector by readback. `flash` checks the JEDEC ID and detected
+capacity before accessing the chip. Reads support capacity codes `0x15`/`0x16`
+(2/4 MiB); writes still require the original `5E4015` 2 MiB device.
+The DDR pool is shared with the stock firmware,
 so the payload window `0x02180000..0x0218ffff` must read as zeros before a session
 and is zeroed again afterwards; anything else aborts the session untouched. A
 changed RAM layout still needs a power cycle between sessions.
@@ -75,13 +77,22 @@ resets:
 
 ```sh
 apxtool rom-rescue jedec                 # read-only: JEDEC, boot header, diagnostic SPRs
-apxtool rom-rescue dump chip.bin         # read the whole 2 MiB chip into a new file
+apxtool rom-rescue dump chip.bin         # read the whole detected 2/4 MiB chip + chip.bin.json
+apxtool rom-rescue dump chip.bin --verify # save, then independently reread in the same session
+apxtool rom-rescue verify chip.bin       # independent full-chip reread, exact capacity required
 apxtool rom-rescue trace                 # decode the SDK's cold-boot flight recorder
 apxtool rom-rescue marks                 # the production build's SRAM boot breadcrumbs
 apxtool rom-rescue pm                    # PM chip registers (read-only)
 apxtool rom-rescue --yes pm --apply      # run the stock power sequence (no flash access)
 apxtool rom-rescue --yes restore image.bin --backup pre-restore.bin
 ```
+
+The [Silvergear printer-camera backup procedure](docs/silvergear-printer-backup.md)
+uses battery-powered forced loader entry and `--spi-init sdk`: hardware inspection
+found SPI disabled in the initial loader state. Its JEDEC ID is `944016`, and a
+full 4 MiB dump matched an independent reread. Newly supported chips are read-only. Dump
+metadata records the chip ID, capacity, image/payload hashes and boot header.
+Program/erase and restore remain restricted to the original `5e4015` 2 MiB chip.
 
 Status: the SRAM pool runs the same SPI sequence as the earlier BootROM recovery
 payload, which was verified on hardware. The DDR pool and the payload-side

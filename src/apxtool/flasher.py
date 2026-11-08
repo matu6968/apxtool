@@ -16,6 +16,8 @@ firmware has been replaced.
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +25,7 @@ from types import SimpleNamespace
 
 from .errors import ApxError, TransferError, UnsafeOperation
 from .protocol import RAM_BASE, RAM_TRANSFER_FUNCTION, FlashGeometry, build_ram_transfer_cdb
-from .sdk_flash import CAPACITY, FlashClient
+from .sdk_flash import FlashClient
 from .transport import inquiry, require_complete
 
 HEADER = struct.Struct("<7I")  # magic, sequence, command, address, length, status, flags
@@ -31,6 +33,7 @@ MAGIC = 0x52585041
 FLAG_KEEP_WATCHDOG = 1
 PENDING = 0xFFFFFFFF
 JEDEC = bytes.fromhex("5e4015")
+READ_CAPACITIES = {0x15: 0x200000, 0x16: 0x400000}
 WATCHDOG_SPR = 0x880C
 SNAPSHOT_SPRS = (0x880C, 0x8858, 0x885C, 0x8864, 0x9000, 0x9244, 0x9248, 0x924C)
 
@@ -82,13 +85,15 @@ class PayloadFlash(FlashClient):
         self.sequence = 0
         self.notes: list[str] = []
         self.chunk = region.capacity
-        self.geometry = FlashGeometry(CAPACITY, 256, 4096, region.capacity)
+        self.geometry: FlashGeometry | None = None
+        self.jedec_id: bytes | None = None
         self._jedec_probe = JEDEC_ROM_STATE
         self._high_water = region.control  # highest address the payload may have written, for the DDR restore
         self._uploaded = False
         code = Path(image).read_bytes() if not isinstance(image, bytes) else image
         if not code or len(code) > region.code_limit:
             raise ValueError(f"flasher exceeds its {region.name} code reservation")
+        self.payload_sha256 = hashlib.sha256(code).hexdigest()
         if not inquiry(device).is_loader:
             raise ValueError("BootROM loader (Buildwin Video050Loader) required")
         try:
@@ -177,6 +182,8 @@ class PayloadFlash(FlashClient):
 
     def _transact(self, cmd, address, length, data=b""):
         """Run one payload command; returns (status, response data)."""
+        if cmd in (CMD_PROGRAM, CMD_ERASE):
+            self.require_writable()
         if not 0 <= length <= self.region.capacity:
             raise ValueError(f"flasher {self.region.name} transfer exceeds {self.region.capacity} bytes")
         self.sequence = (self.sequence + 1) & 0xFFFFFFFF
@@ -214,30 +221,55 @@ class PayloadFlash(FlashClient):
         attempts = []
         if mode in ("auto", "rom"):
             status, data = self._transact(CMD_JEDEC, JEDEC_ROM_STATE, 0)
-            if not status:
+            if status in (0, 3) and self._accept_jedec(data):
+                if status:
+                    raise ApxError(f"payload rejected JEDEC {data.hex()} with status {status}; rebuild appotech-sdk/boot")
                 return "rom-state"
-            attempts.append(f"ROM state read {data.hex()}")
+            attempts.append(f"ROM state read {data.hex()} (status {status})")
         if mode in ("auto", "sdk"):
             status, data = self._transact(CMD_JEDEC, 0, 0)
-            if not status:
+            if status in (0, 3) and self._accept_jedec(data):
+                if status:
+                    raise ApxError(f"payload rejected JEDEC {data.hex()} with status {status}; rebuild appotech-sdk/boot")
                 self._jedec_probe = 0
                 return "sdk-init"
-            attempts.append(f"SDK init read {data.hex()}")
+            attempts.append(f"SDK init read {data.hex()} (status {status})")
         raise TransferError(
-            "flasher could not read the expected JEDEC ID 5e4015 ("
+            "flasher could not read a valid JEDEC ID ("
             + "; ".join(attempts)
             + "). Is the SPI short released and the flash powered?"
         )
 
+    def _accept_jedec(self, data):
+        if len(data) != 3 or data in (b"\x00" * 3, b"\xff" * 3):
+            return False
+        self.jedec_id = data
+        capacity = READ_CAPACITIES.get(data[2])
+        self.geometry = FlashGeometry(capacity, 256, 4096, self.chunk) if capacity else None
+        return True
+
+    @property
+    def capacity(self):
+        return self.hello().size
+
+    def require_writable(self):
+        if self.jedec_id != JEDEC:
+            identity = self.jedec_id.hex() if self.jedec_id is not None else "not probed"
+            raise UnsafeOperation(f"flash {identity} is read-only; erase/program require JEDEC {JEDEC.hex()}")
+
     # -- FlashClient / flash.FlashBackend interface ----------------------------------------
     def _request(self, command, payload=b""):
         if not command:
-            return (
-                b'{"jedec":6176789,"capacity":2097152,"host_read_only":false,'
-                b'"write_protocol":1,"backend":"flasher-' + self.region.name.encode() + b'"}'
-            )
+            return json.dumps({
+                "jedec": int.from_bytes(self.jedec_id, "big") if self.jedec_id is not None else None,
+                "capacity": self.geometry.size if self.geometry else None,
+                "host_read_only": self.jedec_id != JEDEC,
+                "write_protocol": 1 if self.jedec_id == JEDEC else 0,
+                "backend": "flasher-" + self.region.name,
+            }).encode()
         if command == 1:
             address, length = struct.unpack("<II", payload)
+            self.hello().check_range(address, length)
             result = bytearray()
             while len(result) < length:
                 n = min(self.region.capacity, length - len(result))
@@ -250,10 +282,16 @@ class PayloadFlash(FlashClient):
         raise ValueError("unsupported flasher command")
 
     def hello(self) -> FlashGeometry:
+        if self.geometry is None:
+            identity = self.jedec_id.hex() if self.jedec_id is not None else "not probed"
+            raise ApxError(f"unsupported flash capacity for JEDEC {identity}; reads require capacity code 0x15 or 0x16")
         return self.geometry
 
     def flash_id(self) -> bytes:
-        return self.command(CMD_JEDEC, self._jedec_probe, 0)
+        data = self.command(CMD_JEDEC, self._jedec_probe, 0)
+        if not self._accept_jedec(data):
+            raise TransferError(f"invalid SPI NOR JEDEC ID: {data.hex()}")
+        return data
 
     def read_sram(self, address, n):
         """Plain BootROM RAM read (no payload command): SRAM survives resets, e.g. the SDK's boot marks."""

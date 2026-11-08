@@ -3,7 +3,7 @@ from pathlib import Path
 import time
 from .debug import USBTransport,DebugClient,Space
 from .sdk import launch,scsi_port,RESERVATIONS,DISPLAY_RESERVATIONS,ALLOWED_RESERVATIONS
-from .errors import ApxError,DeviceError
+from .errors import ApxError,DeviceError,DebugCommandError
 from .transport import iter_sg_paths,LinuxSCSITransport,inquiry
 from .ram import read_ram,write_ram_experimental
 from .storage import StorageClient
@@ -16,6 +16,7 @@ from .camera import CameraClient
 from .sdk_flash import FlashClient,CAPACITY
 from .battery import BatteryClient
 from .uart import UARTClient
+from .printer import PrinterClient
 
 def configure(parser,sub):
     sdk=sub.add_parser('sdk',help='launch the independent RAM SDK')
@@ -24,6 +25,8 @@ def configure(parser,sub):
     start.add_argument('manifest',type=Path,nargs='?',default=Path(__file__).resolve().parents[3]/'appotech-sdk/build/usb-debug.manifest.json')
     start.add_argument('--timeout',type=float,default=20)
     start.add_argument('--reclaim-jpeg-ram',action='store_true',help='back up and clear the fixed JPEG workspace if vendor RAM occupies it')
+    start.add_argument('--stock-backup',type=Path,help='initialize DDR from forced BootROM using the verified Silvergear backup; RAM only')
+    start.add_argument('--stage',type=Path,help='Silvergear SRAM stage binary')
     debug=sub.add_parser('debug',help='APXD vendor USB debugging')
     debug.add_argument('--port',help='physical USB port, e.g. 7-1')
     debug.add_argument('--vid',type=lambda s:int(s,0),default=0x1908)
@@ -78,7 +81,7 @@ def configure(parser,sub):
     flash=commands.add_parser('flash',help='read or replace SPI firmware using the independent SDK driver')
     nor=flash.add_subparsers(dest='flash_command',required=True);nor.add_parser('info')
     read=nor.add_parser('read');read.add_argument('output',type=Path)
-    read.add_argument('--address',type=integer,default=0);read.add_argument('--length',type=integer,default=CAPACITY)
+    read.add_argument('--address',type=integer,default=0);read.add_argument('--length',type=integer,default=None,help='default: to the end of the chip')
     install=nor.add_parser('install',help='replace the entire SPI firmware; preserves a new verified backup first')
     install.add_argument('image',type=Path);install.add_argument('--backup',type=Path,required=True)
     install.add_argument('--expect-current-sha256',required=True)
@@ -113,6 +116,17 @@ def configure(parser,sub):
     snap.add_argument('--selector',type=int,default=8);snap.add_argument('--output',type=Path);snap.add_argument('--save',help='new file on the camera SD card')
     get=image.add_parser('get');get.add_argument('output',type=Path)
     save=image.add_parser('save');save.add_argument('path')
+    choose=image.add_parser('select');choose.add_argument('camera',choices=('rear','front'))
+    printer=commands.add_parser('printer',help='thermal printer raster, captured photo, feed and cancellation')
+    print_commands=printer.add_subparsers(dest='printer_command',required=True)
+    for name in ('info','cancel','check','shutdown'):print_commands.add_parser(name)
+    photo=print_commands.add_parser('photo');photo.add_argument('--mode',choices=('gray','dot'))
+    mode=print_commands.add_parser('mode');mode.add_argument('mode',choices=('gray','dot'))
+    limit=print_commands.add_parser('temperature-limit');limit.add_argument('index',type=int,choices=range(66))
+    energy=print_commands.add_parser('energy',help='pulse energy percent (100..400) for all modes; 0 returns to the per-mode default');energy.add_argument('percent',type=int)
+    feed=print_commands.add_parser('feed');feed.add_argument('steps',type=int)
+    raster=print_commands.add_parser('raster');raster.add_argument('input',type=Path);raster.add_argument('--width',type=int,required=True);raster.add_argument('--height',type=int,required=True)
+    image=print_commands.add_parser('image');image.add_argument('input',type=Path);image.add_argument('--width',type=int,required=True);image.add_argument('--height',type=int,required=True);image.add_argument('--mode',choices=('gray','dot'))
     mic=commands.add_parser('microphone',help='independent microphone capture and WAV output')
     record=mic.add_subparsers(dest='microphone_command',required=True)
     record.add_parser('info');record.add_parser('stop');record.add_parser('play')
@@ -157,7 +171,7 @@ def wait_bootrom(port,timeout=20,owned_ram=None):
 def run(args):
     if args.command=='sdk':
         if not args.device:raise ValueError('sdk launch requires --device /dev/sgN')
-        transport,info=launch(args.device,args.manifest,args.timeout,reclaim_jpeg_ram=args.reclaim_jpeg_ram)
+        transport,info=launch(args.device,args.manifest,args.timeout,reclaim_jpeg_ram=args.reclaim_jpeg_ram,**({'stock_backup':args.stock_backup,'stage':args.stage} if args.stock_backup else {}))
         try:print(json.dumps(info,indent=2))
         finally:transport.close()
         return 0
@@ -208,10 +222,35 @@ def run(args):
                         print(json.dumps({**event,'pressed_names':button_names(event['pressed']),
                                           'released_names':button_names(event['released'])}),flush=True)
                     time.sleep(.01)
+        elif args.debug_command=='printer':
+            printer=PrinterClient(client)
+            action=args.printer_command
+            if action=='info':print(json.dumps(printer.info(),indent=2))
+            elif action=='cancel':printer.cancel()
+            elif action=='shutdown':printer.shutdown()
+            elif action=='temperature-limit':printer.temperature_limit(args.index)
+            elif action=='mode':printer.mode(args.mode)
+            elif action=='energy':printer.energy(args.percent);print(json.dumps({k:v for k,v in printer.info().items() if k.startswith('energy') or k=='mode_name'}))
+            elif action=='check':printer.check();print(json.dumps(printer.wait(),indent=2))
+            else:
+                if getattr(args,'mode',None):printer.mode(args.mode)
+                if action=='photo':printer.photo()
+                else:
+                    # The printer-only diagnostic intentionally has no camera
+                    # service. A combined demo must stop/drain that service.
+                    if info.get('camera_count'):
+                        try:CameraClient(client).stop()
+                        except DebugCommandError as error:
+                            if error.status!=3:raise
+                    if action=='feed':printer.feed(args.steps)
+                    elif action=='image':printer.image(args.input.read_bytes(),args.width,args.height)
+                    else:printer.raster(args.input.read_bytes(),args.width,args.height)
+                print(json.dumps(printer.wait(),indent=2))
         elif args.debug_command=='camera':
             camera=CameraClient(client);action=args.camera_command
             if action=='info':print(json.dumps(camera.info(),indent=2))
             elif action=='stop':camera.stop()
+            elif action=='select':camera.select(0 if args.camera=='rear' else 1)
             elif action=='preview':camera.preview(args.state=='on')
             elif action=='save':camera.save(args.path)
             elif action in ('get','raw','capture'):

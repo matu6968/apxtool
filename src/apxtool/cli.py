@@ -57,7 +57,7 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     rom_rescue.add_arguments(sub)
     trace_cmd = sub.add_parser("trace", help="decode the SDK cold-boot flight recorder from a saved sector or flash dump")
-    trace_cmd.add_argument("file", type=Path, help="4 KiB sector, or a 2 MiB flash dump (sector read at 0x1ff000)")
+    trace_cmd.add_argument("file", type=Path, help="4 KiB sector, or a flash dump (2 MiB: sector at 0x1ff000; 4 MiB Silvergear: sector at 0x3fe000)")
 
     sub.add_parser("info", help="read standard SCSI INQUIRY and show camera mode")
 
@@ -197,6 +197,7 @@ def _run_flash(dev: SCSITransport, args: argparse.Namespace, device_path: str) -
             print("verified" if matches else "mismatch")
             return 0 if matches else 2
         if args.flash_command == "erase-sector":
+            flash_client.require_writable()
             backup = erase_sector(
                 flash_client,
                 address=args.address,
@@ -206,6 +207,7 @@ def _run_flash(dev: SCSITransport, args: argparse.Namespace, device_path: str) -
             print(f"sector erase verified; full-chip backup: {backup.path} ({backup.sha256})")
             return 0
         if args.flash_command == "write":
+            flash_client.require_writable()
             backup = write_file(
                 flash_client,
                 address=args.address,
@@ -225,8 +227,9 @@ def _run(args: argparse.Namespace) -> int:
         from . import trace as flight_recorder
 
         data = args.file.read_bytes()
-        if len(data) == 2 * 1024 * 1024:
-            data = data[flight_recorder.SECTOR:flight_recorder.SECTOR + flight_recorder.SECTOR_SIZE]
+        if len(data) in (2 * 1024 * 1024, 4 * 1024 * 1024):
+            start = flight_recorder.sector_for(len(data))
+            data = data[start:start + flight_recorder.SECTOR_SIZE]
         print(flight_recorder.format_report(flight_recorder.decode(data)))
         return 0
     if args.command in ("sdk", "debug"):

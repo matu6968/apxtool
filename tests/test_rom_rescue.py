@@ -1,4 +1,5 @@
 import hashlib
+import json
 import struct
 from pathlib import Path
 from unittest.mock import patch
@@ -13,12 +14,30 @@ from apxtool.transport import SCSITransfer
 PAYLOAD = bytes(range(256)) * 4
 
 
+def test_open_loader_waits_for_node_and_permissions():
+    device = object()
+    with patch.object(rom_rescue, "LinuxSCSITransport", side_effect=[
+        FileNotFoundError(), PermissionError(), device,
+    ]) as opened, patch.object(rom_rescue.time, "sleep") as sleep:
+        assert rom_rescue.open_loader("/dev/sg0") is device
+    assert opened.call_count == 3
+    assert sleep.call_count == 2
+
+
+def test_open_loader_node_wait_is_bounded():
+    with patch.object(rom_rescue, "LinuxSCSITransport", side_effect=FileNotFoundError()), \
+            patch.object(rom_rescue.time, "monotonic", side_effect=[0, 2]):
+        with pytest.raises(FileNotFoundError):
+            rom_rescue.open_loader("/dev/sg0", grace=1)
+
+
 class FakeROM:
     """Models the forced BootROM 0xcb command plus the SRAM rescue payload."""
 
-    def __init__(self, *, rom_state_ok=True, sdk_init_ok=True, watchdog_stays_on=False):
+    def __init__(self, *, rom_state_ok=True, sdk_init_ok=True, watchdog_stays_on=False, jedec=flasher.JEDEC):
         self.sram = bytearray(0x4000)
-        self.flash = bytearray(b"\xff" * CAPACITY)
+        self.jedec = jedec
+        self.flash = bytearray(b"\xff" * flasher.READ_CAPACITIES.get(jedec[2], CAPACITY))
         self.rom_state_ok, self.sdk_init_ok = rom_state_ok, sdk_init_ok
         self.watchdog = 0x1D
         self.watchdog_stays_on = watchdog_stays_on
@@ -56,8 +75,7 @@ class FakeROM:
             out = struct.pack("<8I", self.watchdog, *range(7))
         elif cmd == flasher.CMD_JEDEC:
             ok = self.rom_state_ok if a & 1 else self.sdk_init_ok
-            out = flasher.JEDEC if ok else b"\xff\xff\xff"
-            status = 0 if ok else 3
+            out = self.jedec if ok else b"\xff\xff\xff"
         elif cmd in (flasher.CMD_PM_READ, flasher.CMD_PM_ENABLE):
             assert n == 14
             if cmd == flasher.CMD_PM_ENABLE:
@@ -106,7 +124,7 @@ def test_falls_back_to_sdk_init_and_reports_stuck_watchdog():
 def test_jedec_failure_names_the_short():
     with pytest.raises(TransferError, match="SPI short released"):
         flasher.PayloadFlash(FakeROM(rom_state_ok=False, sdk_init_ok=False), PAYLOAD)
-    with pytest.raises(TransferError, match="expected JEDEC"):
+    with pytest.raises(TransferError, match="valid JEDEC"):
         flasher.PayloadFlash(FakeROM(rom_state_ok=False), PAYLOAD, spi_init="rom")
 
 
@@ -245,3 +263,221 @@ def test_pm_apply_requires_confirmation(tmp_path, capsys):
     payload.write_bytes(PAYLOAD)
     assert cli.main(["rom-rescue", "--payload", str(payload), "--timeout", "1", "pm", "--apply"]) == 2
     assert "--yes" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("jedec", [flasher.JEDEC, bytes.fromhex("5e4016"), bytes.fromhex("ef4016"), bytes.fromhex("944016")])
+def test_full_dump_metadata_and_independent_verification(tmp_path, jedec):
+    rom = FakeROM(jedec=jedec)
+    capacity = len(rom.flash)
+    rom.flash[-1] = 0x42
+    if capacity == 0x400000:
+        rom.flash[0x200000:0x200004] = b"HIGH"
+    client = flasher.PayloadFlash(rom, PAYLOAD, spi_init="rom")
+    output = tmp_path / "stock.bin"
+    result = rom_rescue.action_dump(client, 1, output)
+    assert output.read_bytes() == bytes(rom.flash) and output.stat().st_size == capacity
+    metadata = json.loads((tmp_path / "stock.bin.json").read_text())
+    assert metadata == result and metadata["jedec"] == jedec.hex() and metadata["capacity"] == capacity
+    assert metadata["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
+    assert metadata["payload_sha256"] == hashlib.sha256(PAYLOAD).hexdigest()
+    assert not metadata["boot_header"]["boot_header_valid"]  # invalid headers never block a raw backup
+    assert not list(tmp_path.glob("*.part"))
+
+    before = rom.runs
+    verified = rom_rescue.action_verify(client, 1, output.read_bytes())
+    assert verified["verified"] and verified["first_mismatch"] is None
+    assert verified["expected_sha256"] == verified["actual_sha256"] == result["sha256"]
+    assert rom.runs - before == capacity // 512  # complete second read, never just cached bytes
+    rom.flash[-1] ^= 1
+    failed = rom_rescue.action_verify(client, 1, output.read_bytes())
+    assert not failed["verified"] and failed["first_mismatch"] == capacity - 1
+    assert failed["expected_sha256"] != failed["actual_sha256"] and not rom.erases
+
+
+def test_identification_reports_unknown_geometry_without_reading_flash():
+    client = flasher.PayloadFlash(FakeROM(jedec=bytes.fromhex("ab4017")), PAYLOAD)
+    result = rom_rescue.action_jedec(client, 1)
+    assert result["jedec"] == "ab4017" and result["capacity"] is None and not result["read_supported"]
+    assert result["host_read_only"] and "boot_header_valid" not in result
+    assert client.spi_path == "rom-state" and client.device.runs == 3  # snapshot, two raw ID probes only
+    with pytest.raises(ApxError, match="ab4017"):
+        client.read(0, 1)
+
+
+def test_legacy_payload_rejection_never_triggers_sdk_init_for_a_valid_id():
+    rom = FakeROM(jedec=bytes.fromhex("ef4016"))
+    original = rom._payload
+
+    def old_payload(base):
+        original(base)
+        if struct.unpack_from("<I", rom.sram, base + 8)[0] == flasher.CMD_JEDEC:
+            assert struct.unpack_from("<I", rom.sram, base + 12)[0] == flasher.JEDEC_ROM_STATE
+            struct.pack_into("<I", rom.sram, base + 20, 3)
+
+    rom._payload = old_payload
+    with pytest.raises(ApxError, match="rebuild"):
+        flasher.PayloadFlash(rom, PAYLOAD, spi_init="auto")
+    assert rom.runs == 2
+
+
+def test_partial_id_on_transfer_timeout_is_not_accepted_as_a_chip():
+    rom = FakeROM()
+    original = rom._payload
+
+    def timed_out_probe(base):
+        original(base)
+        if struct.unpack_from("<I", rom.sram, base + 8)[0] == flasher.CMD_JEDEC:
+            rom.sram[base + 28:base + 31] = bytes.fromhex("ff0000")
+            struct.pack_into("<I", rom.sram, base + 20, 2)
+
+    rom._payload = timed_out_probe
+    with pytest.raises(TransferError, match=r"ff0000 \(status 2\)"):
+        flasher.PayloadFlash(rom, PAYLOAD, spi_init="rom")
+
+
+def test_interrupted_dump_leaves_no_output_or_metadata(tmp_path):
+    rom = FakeROM(jedec=bytes.fromhex("ef4016"))
+    client = flasher.PayloadFlash(rom, PAYLOAD)
+    rom.drop_after = rom.runs + 2
+    with pytest.raises(TransferError, match="disappeared"):
+        rom_rescue.action_dump(client, 1, tmp_path / "stock.bin")
+    assert not list(tmp_path.iterdir())
+
+
+def test_interrupted_verification_cannot_report_success():
+    rom = FakeROM()
+    client = flasher.PayloadFlash(rom, PAYLOAD)
+    rom.drop_after = rom.runs + 2
+    with pytest.raises(TransferError, match="disappeared"):
+        rom_rescue.action_verify(client, 1, bytes(rom.flash))
+
+
+def test_metadata_failure_preserves_completed_dump(tmp_path):
+    client = flasher.PayloadFlash(FakeROM(), PAYLOAD)
+    original_write = rom_rescue._write_new_file
+
+    def fail_metadata(path, data):
+        if path.suffix == ".json":
+            raise OSError("disk full")
+        original_write(path, data)
+
+    with patch.object(rom_rescue, "_write_new_file", side_effect=fail_metadata):
+        with pytest.raises(ApxError, match="preserved"):
+            rom_rescue.action_dump(client, 1, tmp_path / "stock.bin")
+    assert (tmp_path / "stock.bin").read_bytes() == bytes(client.device.flash)
+    assert not (tmp_path / "stock.bin.json").exists()
+
+
+@pytest.mark.parametrize("existing", ["stock.bin", "stock.bin.json", "stock.bin.part", "stock.bin.json.part"])
+def test_dump_preflight_refuses_any_existing_artifact_without_usb(tmp_path, existing, capsys):
+    payload = tmp_path / "p.bin"
+    payload.write_bytes(PAYLOAD)
+    path = tmp_path / existing
+    path.write_bytes(b"preserve")
+    with patch.object(rom_rescue, "run_when_caught") as run:
+        assert cli.main(["rom-rescue", "--payload", str(payload), "dump", str(tmp_path / "stock.bin")]) == 2
+        run.assert_not_called()
+    assert path.read_bytes() == b"preserve" and "refusing to overwrite" in capsys.readouterr().err
+
+
+def test_verify_cli_success_mismatch_and_wrong_capacity(tmp_path, capsys):
+    rom = FakeROM(jedec=bytes.fromhex("ef4016"))
+    client = flasher.PayloadFlash(rom, PAYLOAD)
+    payload, image = tmp_path / "p.bin", tmp_path / "stock.bin"
+    payload.write_bytes(PAYLOAD)
+    image.write_bytes(rom.flash)
+    base = ["rom-rescue", "--payload", str(payload), "--spi-init", "rom", "verify", str(image)]
+
+    def run(action, **kwargs):
+        assert kwargs["spi_init"] == "rom"
+        return action(client, 1)
+
+    with patch.object(rom_rescue, "run_when_caught", side_effect=run):
+        assert cli.main(base) == 0 and json.loads(capsys.readouterr().out)["verified"]
+        rom.flash[0x200001] = 0
+        assert cli.main(base) == 2
+        assert json.loads(capsys.readouterr().out)["first_mismatch"] == 0x200001
+        image.write_bytes(b"\xff" * CAPACITY)
+        before = rom.runs
+        assert cli.main(base) == 2 and "exactly 4194304 bytes" in capsys.readouterr().err
+        assert rom.runs == before  # valid file size for the wrong chip is rejected before reads
+    image.write_bytes(b"short")
+    with patch.object(rom_rescue, "run_when_caught") as run:
+        assert cli.main(base) == 2
+        run.assert_not_called()
+
+
+def test_dump_verify_cli_keeps_both_reads_in_one_session(tmp_path, capsys):
+    client = flasher.PayloadFlash(FakeROM(jedec=bytes.fromhex("944016")), PAYLOAD)
+    payload, output = tmp_path / "p.bin", tmp_path / "stock.bin"
+    payload.write_bytes(PAYLOAD)
+    before = client.device.runs
+    with patch.object(rom_rescue, "run_when_caught", side_effect=lambda action, **kwargs: action(client, 1)) as run:
+        args = ["rom-rescue", "--payload", str(payload), "dump", str(output), "--verify"]
+        assert cli.main(args) == 0 and run.call_count == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["verification"]["verified"] and result["dump"]["jedec"] == "944016"
+    assert client.device.runs - before == 2 * 0x400000 // 512
+    assert json.loads((tmp_path / "stock.bin.verify.json").read_text()) == result["verification"]
+    assert (tmp_path / "stock.bin.json").is_file()
+
+
+def test_dump_verify_retries_only_verification_after_disconnect(tmp_path, capsys):
+    from contextlib import nullcontext
+
+    payload, output = tmp_path / "p.bin", tmp_path / "stock.bin"
+    payload.write_bytes(PAYLOAD)
+    first, second = FakeROM(), FakeROM()
+    first.drop_after = 2 + CAPACITY // 512 + 2  # snapshot + JEDEC, dump, two verify blocks
+    with patch.object(rom_rescue, "loader_sg_paths", return_value=["/dev/sg9"]), \
+            patch.object(rom_rescue, "open_loader", side_effect=[nullcontext(first), nullcontext(second)]), \
+            patch.object(rom_rescue.time, "sleep"):
+        assert cli.main(["rom-rescue", "--payload", str(payload), "dump", str(output), "--verify"]) == 0
+    assert second.runs == 2 + CAPACITY // 512  # second session does not repeat the dump
+    assert output.read_bytes() == bytes(first.flash)
+    assert json.loads((tmp_path / "stock.bin.verify.json").read_text())["verified"]
+
+
+@pytest.mark.parametrize("existing", ["stock.bin.verify.json", "stock.bin.verify.json.part"])
+def test_dump_verify_preflight_checks_report_before_usb(tmp_path, existing):
+    payload = tmp_path / "p.bin"
+    payload.write_bytes(PAYLOAD)
+    (tmp_path / existing).write_bytes(b"preserve")
+    with patch.object(rom_rescue, "run_when_caught") as run:
+        assert cli.main(["rom-rescue", "--payload", str(payload), "dump", str(tmp_path / "stock.bin"), "--verify"]) == 2
+        run.assert_not_called()
+
+
+def test_restore_read_only_chip_is_refused_before_backup_or_reads(tmp_path):
+    rom = FakeROM(jedec=bytes.fromhex("ef4015"))
+    client = flasher.PayloadFlash(rom, PAYLOAD)
+    before = rom.runs
+    with pytest.raises(ApxError, match="read-only"):
+        rom_rescue.action_restore(client, 1, boot_image(), tmp_path / "backup.bin", "auto")
+    assert rom.runs == before and not list(tmp_path.iterdir()) and not rom.erases
+
+
+def test_rescue_does_not_retry_deterministic_failures(tmp_path):
+    from contextlib import nullcontext
+
+    payload = tmp_path / "p.bin"
+    payload.write_bytes(PAYLOAD)
+    with patch.object(rom_rescue, "loader_sg_paths", return_value=["/dev/sg9"]), \
+            patch.object(rom_rescue, "open_loader", return_value=nullcontext(FakeROM())) as opened:
+        with pytest.raises(ValueError, match="exactly"):
+            rom_rescue.run_when_caught(lambda c, n: rom_rescue.action_verify(c, n, b"short"),
+                                      payload=payload, timeout=1, log=lambda *_: None)
+        assert opened.call_count == 1
+
+
+def test_rescue_retries_a_vanished_sg_node(tmp_path):
+    from contextlib import nullcontext
+
+    payload = tmp_path / "p.bin"
+    payload.write_bytes(PAYLOAD)
+    vanished = FileNotFoundError(2, "No such file or directory", "/dev/sg9")
+    with patch.object(rom_rescue, "loader_sg_paths", return_value=["/dev/sg9"]), \
+            patch.object(rom_rescue, "open_loader", side_effect=[vanished, nullcontext(FakeROM())]) as opened, \
+            patch.object(rom_rescue.time, "sleep"):
+        result = rom_rescue.run_when_caught(rom_rescue.action_jedec, payload=payload, timeout=1, log=lambda *_: None)
+    assert result["jedec"] == "5e4015" and opened.call_count == 2

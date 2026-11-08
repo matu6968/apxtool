@@ -3,7 +3,7 @@ import json
 import struct
 from .debug import Operation
 from .errors import TransferError
-BUTTON_NAMES=('SHUTTER','DOWN','UP','LEFT','RIGHT','POWER')
+BUTTON_NAMES=('SHUTTER','DOWN','UP','LEFT','RIGHT','POWER','MODE','PRINT','CAMERA','EXIT')
 def button_names(mask):
     return [name for bit,name in enumerate(BUTTON_NAMES) if mask&(1<<bit)]
 class GPIOClient:

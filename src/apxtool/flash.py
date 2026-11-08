@@ -223,9 +223,9 @@ def erase_sector(
 def require_flash_id(jedec_id: bytes) -> None:
     if len(jedec_id) != 3 or jedec_id in {b"\x00\x00\x00", b"\xff\xff\xff"}:
         raise ApxError(f"invalid SPI NOR JEDEC ID: {jedec_id.hex(' ')}")
-    if jedec_id[2] != 0x15:
+    if jedec_id[2] not in (0x15, 0x16):
         raise ApxError(
             f"SPI NOR returned JEDEC bytes {jedec_id.hex().upper()} with capacity code "
-            f"0x{jedec_id[2]:02x}; apxtool is configured for the camera's 2 MiB flash "
-            "(capacity code 0x15)"
+            f"0x{jedec_id[2]:02x}; loader reads support 2/4 MiB flash "
+            "(capacity codes 0x15/0x16)"
         )

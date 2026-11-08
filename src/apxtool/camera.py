@@ -20,6 +20,9 @@ class CameraClient:
     def _empty(self,command,data=b''):
         if self._request(command,data):raise TransferError('unexpected camera payload')
     def info(self):return json.loads(self._request(0))
+    def select(self,camera):
+        if type(camera)!=int or camera not in (0,1):raise ValueError("camera must be 0 (rear) or 1 (front)")
+        self._empty(8,struct.pack("<I",camera))
     def preview(self,enabled=True):
         if type(enabled)!=bool:raise ValueError('preview requires a boolean')
         self._empty(1,struct.pack('<I',int(enabled)))

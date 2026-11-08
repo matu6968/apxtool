@@ -47,8 +47,13 @@ def load_manifest(path):
     if not any(segment.get('flags',1)&1 and segment['address']<=manifest['entry']<segment['address']+segment['bytes'] for segment in manifest['segments']):
         raise ValueError('entry is outside executable segments')
     return manifest,images
-def launch(device_path,manifest_path,timeout=20,*,reclaim_jpeg_ram=False):
+def launch(device_path,manifest_path,timeout=20,*,reclaim_jpeg_ram=False,stock_backup=None,stage=None):
     manifest,images=load_manifest(manifest_path)
+    if stock_backup is not None:
+        if manifest.get('board')!='silvergear-3222882':raise ValueError('forced-ROM stage requires a Silvergear manifest')
+        from .silvergear import prepare
+        result=prepare(device_path,stock_backup,stage,timeout=timeout)
+        device_path=result['device']
     port=scsi_port(device_path)
     path,device,identity=enter_loader_with_device(device_path,timeout=timeout)
     originals=[];takeover=False

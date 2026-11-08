@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from apxtool import cli, flasher
+from apxtool import cli, flasher, rom_rescue
 from apxtool.errors import ApxError, TransferError, UnsafeOperation
 from apxtool.flash import write_file
 from apxtool.protocol import RAM_TRANSFER_FUNCTION
@@ -50,8 +50,9 @@ def library(tmp_path_factory):
 class LoaderModel:
     """BootROM loader SCSI behaviour for INQUIRY and 0xcb, backed by the compiled payload."""
 
-    def __init__(self, lib, *, ddr_alive=True):
+    def __init__(self, lib, *, ddr_alive=True, jedec=flasher.JEDEC):
         lib.model_reset()
+        lib.model_set_flash(int.from_bytes(jedec, "big"))
         self.lib = lib
         self.sram = ctypes.create_string_buffer(SRAM_SIZE)
         self.ddr = ctypes.create_string_buffer(DDR_SIZE)
@@ -60,7 +61,8 @@ class LoaderModel:
         self.callbacks = []
         self.corrupt_next_write = False
         self.skip_callback = False
-        self.nor = lib.model_nor().contents
+        capacity = flasher.READ_CAPACITIES.get(jedec[2], CAPACITY)
+        self.nor = (ctypes.c_uint8 * capacity).from_address(ctypes.addressof(lib.model_nor().contents))
 
     def _where(self, address, n):
         if SRAM_BASE <= address and address + n <= SRAM_BASE + SRAM_SIZE:
@@ -100,6 +102,90 @@ def fill_nor(loader, seed=5):
     data = bytes((index * 13 + seed) & 0xFF for index in range(CAPACITY))
     ctypes.memmove(loader.nor, data, CAPACITY)
     return data
+
+
+@pytest.mark.parametrize("region", [flasher.SRAM, flasher.DDR], ids=lambda r: r.name)
+@pytest.mark.parametrize("jedec", [bytes.fromhex("5e4016"), bytes.fromhex("ef4016"), bytes.fromhex("944016")])
+def test_four_mib_read_bounds_and_write_guards(library, region, jedec):
+    loader = LoaderModel(library, jedec=jedec, ddr_alive=region != flasher.SRAM)
+    # Distinct halves catch a two-MiB address wrap, including boundary-spanning reads.
+    original = b"\x12" * CAPACITY + b"\x34" * (CAPACITY - 1) + b"\x56"
+    ctypes.memmove(loader.nor, original, len(original))
+    with flasher.PayloadFlash(loader, CODE, region, spi_init="rom") as client:
+        assert client.flash_id() == jedec and client.capacity == 0x400000
+        info = client.info()
+        assert info["capacity"] == 0x400000 and info["jedec"] == int.from_bytes(jedec, "big")
+        assert info["host_read_only"] and info["write_protocol"] == 0
+        assert client.read(0x1FFFFF, 2) == b"\x12\x34"
+        assert client.read(0x200000, 513) == b"\x34" * 513
+        assert client.read(0x3FFFFF, 1) == b"\x56"
+        assert client.read(0x400000, 0) == b""
+        before = len(loader.callbacks)
+        for a, n in ((0x3FFFFF, 2), (0x400000, 1), (0x100000000, 0), (-1, 1), (False, 1)):
+            with pytest.raises(ValueError):
+                client.read(a, n)
+        for write in (lambda: client.erase_sector(0), lambda: client.program_page(0, b"x"),
+                      lambda: client.command(flasher.CMD_ERASE, 0, 0)):
+            with pytest.raises(UnsafeOperation, match="read-only"):
+                write()
+        assert len(loader.callbacks) == before  # host guard: no write request reached the loader
+
+        # Bypass the host guard and execute the real C payload with forged writes and bad reads.
+        for cmd, a, n, data in ((flasher.CMD_ERASE, 0, 0, b""), (flasher.CMD_PROGRAM, 0, 1, b"x"),
+                                (flasher.CMD_READ, 0x3FFFFF, 2, b""), (flasher.CMD_READ, 0x400000, 1, b"")):
+            block = flasher.HEADER.pack(flasher.MAGIC, 1, cmd, a, n, flasher.PENDING, 0) + data
+            base = ctypes.addressof(loader.sram) + flasher.SRAM.control - SRAM_BASE
+            ctypes.memmove(base, block, len(block))
+            library.model_call(base)
+            assert flasher.HEADER.unpack(ctypes.string_at(base, flasher.HEADER.size))[5] != 0
+        assert library.model_command_count(6) == 0  # no WREN, erase or program on the chip
+        assert library.model_command_count(2) == 0 and library.model_command_count(0x20) == 0
+        assert bytes(loader.nor) == original
+        assert library.model_get_spr(0x8850) == 0  # unfamiliar manufacturer did not trigger SDK init
+
+
+@pytest.mark.parametrize("jedec", [bytes.fromhex("ef4015"), bytes.fromhex("ab4017")])
+def test_unfamiliar_chips_identify_without_alternate_initialization(library, jedec):
+    loader = LoaderModel(library, jedec=jedec)
+    with flasher.PayloadFlash(loader, CODE, spi_init="auto") as client:
+        assert client.flash_id() == jedec and client.spi_path == "rom-state"
+        assert client.info()["host_read_only"]
+        if jedec[2] == 0x15:
+            assert client.read(0, 1) == b"\xff"
+        else:
+            before = library.model_command_count(3)
+            with pytest.raises(ApxError, match="ab4017"):
+                client.read(0, 1)
+            # Even a host which bypasses hello() cannot read unsupported geometry.
+            with pytest.raises(TransferError):
+                client.command(flasher.CMD_READ, 0, 1)
+            assert library.model_command_count(3) == before
+        with pytest.raises(UnsafeOperation):
+            client.program_page(0, b"x")
+        assert library.model_command_count(6) == 0 and library.model_get_spr(0x8850) == 0
+
+
+def test_four_mib_backup_and_verify_against_real_payload(library, tmp_path):
+    loader = LoaderModel(library, jedec=bytes.fromhex("ef4016"), ddr_alive=False)
+    image = b"A" * CAPACITY + b"B" * (CAPACITY - 1) + b"C"
+    ctypes.memmove(loader.nor, image, len(image))
+    with flasher.PayloadFlash(loader, CODE, spi_init="rom") as client:
+        output = tmp_path / "stock.bin"
+        evidence = rom_rescue.action_dump(client, 1, output)
+        assert output.read_bytes() == image
+        result = rom_rescue.action_verify(client, 1, output.read_bytes())
+        assert result["verified"] and result["actual_sha256"] == evidence["sha256"]
+        assert evidence["capacity"] == 0x400000 and library.model_command_count(3) == 2 * 0x400000 // 512
+        assert library.model_command_count(6) == 0 and library.model_command_count(2) == 0
+        assert library.model_command_count(0x20) == 0
+
+
+@pytest.mark.parametrize("jedec", [b"\0" * 3, b"\xff" * 3])
+def test_invalid_bus_response_preserves_raw_id_in_error(library, jedec):
+    loader = LoaderModel(library, jedec=jedec)
+    with pytest.raises(TransferError, match=jedec.hex()):
+        flasher.PayloadFlash(loader, CODE, spi_init="rom")
+    assert library.model_command_count(3) == 0 and library.model_command_count(6) == 0
 
 
 @pytest.mark.parametrize("region", [flasher.SRAM, flasher.DDR], ids=lambda r: r.name)

@@ -5,6 +5,12 @@ import struct
 
 SECTOR = 0x1FF000
 SECTOR_SIZE = 4096
+SILVERGEAR_SECTOR = 0x3FE000  # last-but-one sector of the 4 MiB chip (board.h APX_SPI_TRACE_SECTOR)
+
+
+def sector_for(capacity: int) -> int:
+    """Flight-recorder sector for a chip of this size: 2 MiB Action camera or 4 MiB Silvergear."""
+    return SILVERGEAR_SECTOR if capacity == 4 * 1024 * 1024 else SECTOR
 REGS_OFFSET = 0x100
 CRUMBS_OFFSET = 0x800
 SNAPSHOTS = 4

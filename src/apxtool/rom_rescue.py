@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import glob
 import hashlib
-import os
+import json
 import struct
 import time
 from pathlib import Path
 
-from .errors import ApxError, DeviceError
+from .errors import ApxError, DeviceError, TransferError
+from .flash import _write_new_file
 from .flasher import PM_REGISTERS, SRAM, WATCHDOG_SPR, PayloadFlash, default_payload
 from .sdk_flash import CAPACITY
 from .transport import LinuxSCSITransport
@@ -59,12 +60,12 @@ def loader_sg_paths() -> list[str]:
 
 
 def open_loader(path: str, *, grace: float = 1.0) -> LinuxSCSITransport:
-    """Open an sg node, riding out the short window before udev grants access."""
+    """Open an sg node while udev creates it and grants access."""
     deadline = time.monotonic() + grace
     while True:
         try:
             return LinuxSCSITransport(path)
-        except PermissionError:
+        except (FileNotFoundError, PermissionError):
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.01)
@@ -84,7 +85,7 @@ def run_when_caught(action, *, payload, timeout, spi_init="auto", device=None, l
     deadline = time.monotonic() + timeout
     attempt = 0
     last = None
-    log("waiting for the forced BootROM (USB 1908:3319): hold the SPI short, then connect USB power")
+    log("waiting for the forced BootROM (USB 1908:3319); release the SPI short once loader mode is entered")
     while time.monotonic() < deadline and (attempt_limit is None or attempt < attempt_limit):
         paths = [device] if device else loader_sg_paths()
         if not paths:
@@ -102,7 +103,13 @@ def run_when_caught(action, *, payload, timeout, spi_init="auto", device=None, l
                 for note in client.notes:
                     log("note: " + note)
                 return action(client, attempt)
-        except (OSError, ApxError, ValueError) as exc:
+        except (OSError, TransferError) as exc:
+            # A vanished sg node is a normal enumeration race. Local-file and
+            # persistent permission failures must fail promptly, not loop.
+            if isinstance(exc, (FileExistsError, PermissionError)):
+                raise
+            if isinstance(exc, FileNotFoundError) and exc.filename != paths[0]:
+                raise
             last = exc
             log(f"attempt {attempt} failed after {time.monotonic() - started:.2f}s: {exc}")
             # Let the ROM drop off the bus before looking for the next cycle.
@@ -118,21 +125,35 @@ def describe_image(image: bytes) -> str:
     return f"{digest} ({KNOWN_IMAGES.get(digest, 'unrecognised image')})"
 
 
-def action_jedec(client, attempt):
-    header = client.read(0, 512)
-    flags = header[10]
-    valid = struct.unpack_from("<H", header, 2)[0] == 2 and header[4:8] == b"BLDR" and header[510:512] == b"\x55\xaa"
+def boot_header_diagnostics(header):
+    """Describe the raw first sector; an invalid header is still worth backing up."""
+    if len(header) != 512:
+        raise ValueError("boot header diagnostics require exactly 512 bytes")
     return {
-        "jedec": "5e4015",
-        "spi_path": client.spi_path,
-        "watchdog_off": client.watchdog_off,
-        "snapshot": {f"{k:#06x}": f"{v:#010x}" for k, v in client.snapshot.items()},
-        "boot_header_valid": valid,
-        "header_flags": flags,
+        "boot_header_valid": struct.unpack_from("<H", header, 2)[0] == 2
+            and header[4:8] == b"BLDR" and header[510:512] == b"\x55\xaa",
+        "header_flags": header[10],
         "load_address": struct.unpack_from("<I", header, 0x20)[0],
         "load_sectors": struct.unpack_from("<I", header, 0x28)[0],
         "header_sha256": hashlib.sha256(header).hexdigest(),
     }
+
+
+def action_jedec(client, attempt):
+    jedec = client.flash_id()
+    result = {
+        "jedec": jedec.hex(),
+        "capacity": client.geometry.size if client.geometry else None,
+        "read_supported": client.geometry is not None,
+        "host_read_only": client.info()["host_read_only"],
+        "payload_sha256": client.payload_sha256,
+        "spi_path": client.spi_path,
+        "watchdog_off": client.watchdog_off,
+        "snapshot": {f"{k:#06x}": f"{v:#010x}" for k, v in client.snapshot.items()},
+    }
+    if client.geometry is not None:
+        result.update(boot_header_diagnostics(client.read(0, 512)))
+    return result
 
 
 def action_pm(client, attempt, apply):
@@ -157,18 +178,73 @@ def action_marks(client, attempt):
     return flight_recorder.decode_marks(client.read_sram(flight_recorder.MARKS_ADDRESS, flight_recorder.MARKS_BYTES))
 
 
+def dump_paths(output):
+    output = Path(output).expanduser().absolute()
+    return output, output.with_suffix(output.suffix + ".json")
+
+
+def verification_path(output):
+    output = dump_paths(output)[0]
+    return output.with_suffix(output.suffix + ".verify.json")
+
+
+def check_dump_paths(output, *, verify=False):
+    paths = dump_paths(output)
+    for path in paths + ((verification_path(output),) if verify else ()):
+        for candidate in (path, path.with_name(path.name + ".part")):
+            if candidate.exists() or candidate.is_symlink():
+                raise FileExistsError(f"refusing to overwrite {candidate}")
+        if not path.parent.is_dir():
+            raise FileNotFoundError(path.parent)
+    return paths
+
+
 def action_dump(client, attempt, output):
-    output = Path(output)
-    image = client.read(0, CAPACITY)
-    with output.open("xb") as file:
-        file.write(image)
-        file.flush()
-        os.fsync(file.fileno())
-    return describe_image(image)
+    output, metadata = check_dump_paths(output)
+    capacity = client.hello().size
+    image = client.read(0, capacity)
+    if len(image) != capacity:
+        raise TransferError(f"short full-chip read: received {len(image)} bytes, expected {capacity}")
+    evidence = {
+        "jedec": client.jedec_id.hex(),
+        "capacity": capacity,
+        "sha256": hashlib.sha256(image).hexdigest(),
+        "payload_sha256": client.payload_sha256,
+        "spi_path": client.spi_path,
+        "boot_header": boot_header_diagnostics(image[:512]),
+    }
+    # Save only a completed read. If metadata cannot be saved, keep the raw backup
+    # and fail without retrying or overwriting either file.
+    try:
+        _write_new_file(output, image)
+        _write_new_file(metadata, (json.dumps(evidence, indent=2) + "\n").encode())
+    except OSError as exc:
+        raise ApxError(f"could not save dump/metadata: {exc}; any completed backup at {output} is preserved") from exc
+    return evidence
+
+
+def action_verify(client, attempt, image):
+    capacity = client.hello().size
+    if len(image) != capacity:
+        raise ValueError(f"verification image must be exactly {capacity} bytes; got {len(image)}")
+    actual = client.read(0, capacity)
+    if len(actual) != capacity:
+        raise TransferError(f"short verification read: received {len(actual)} bytes, expected {capacity}")
+    matches = actual == image
+    return {
+        "verified": matches,
+        "jedec": client.jedec_id.hex(),
+        "capacity": capacity,
+        "expected_sha256": hashlib.sha256(image).hexdigest(),
+        "actual_sha256": hashlib.sha256(actual).hexdigest(),
+        "payload_sha256": client.payload_sha256,
+        "first_mismatch": next((i for i, (a, b) in enumerate(zip(image, actual)) if a != b), None) if not matches else None,
+    }
 
 
 def action_restore(client, attempt, image, backup, expected_sha256, log=_flush_print):
     """Back up the chip, then restore ``image`` (header sector last, per-sector verify)."""
+    client.require_writable()
     backup = Path(backup)
     if attempt > 1:
         backup = backup.with_name(f"{backup.name}.retry{attempt}")
@@ -210,8 +286,11 @@ def add_arguments(sub) -> None:
     rescue.add_argument("--yes", action="store_true", help="acknowledge destructive flash writes")
     actions = rescue.add_subparsers(dest="rescue_command", required=True)
     actions.add_parser("jedec", help="read-only: JEDEC ID, boot header sector and diagnostic SPRs")
-    dump = actions.add_parser("dump", help="read the whole 2 MiB chip into a new file")
+    dump = actions.add_parser("dump", help="read the whole detected 2/4 MiB chip into a new file, with JSON metadata")
     dump.add_argument("output", type=Path)
+    dump.add_argument("--verify", action="store_true", help="immediately reread the full chip in the same session; save OUTPUT.verify.json")
+    verify = actions.add_parser("verify", help="read-only: compare an exact-capacity file with a fresh full-chip read")
+    verify.add_argument("input", type=Path)
     trace = actions.add_parser("trace", help="read-only: decode the SDK cold-boot flight recorder sector")
     trace.add_argument("--save", type=Path, help="also save the raw 4 KiB sector to a new file")
     actions.add_parser("marks", help="read-only: the production build's always-on SRAM boot breadcrumbs (0x2f00)")
@@ -225,8 +304,6 @@ def add_arguments(sub) -> None:
 
 
 def run_cli(args) -> int:
-    import json
-
     payload = args.payload or default_payload()
     if not Path(payload).is_file():
         raise ApxError(f"flasher payload not built: {payload} (run make -C appotech-sdk/boot)")
@@ -254,7 +331,7 @@ def run_cli(args) -> int:
             raise FileExistsError(f"refusing to overwrite {args.save}")
 
         def read_trace(client, attempt):
-            sector = client.read(flight_recorder.SECTOR, flight_recorder.SECTOR_SIZE)
+            sector = client.read(flight_recorder.sector_for(client.capacity), flight_recorder.SECTOR_SIZE)
             if args.save:
                 with args.save.open("xb") as file:
                     file.write(sector)
@@ -263,10 +340,39 @@ def run_cli(args) -> int:
         print(flight_recorder.format_report(flight_recorder.decode(run_when_caught(read_trace, **common))))
         return 0
     if args.rescue_command == "dump":
-        if args.output.exists():
-            raise FileExistsError(f"refusing to overwrite {args.output}")
-        print("dumped", run_when_caught(lambda c, n: action_dump(c, n, args.output), **common))
-        return 0
+        output, _ = check_dump_paths(args.output, verify=args.verify)
+        saved = None
+
+        def capture(client, attempt):
+            nonlocal saved
+            if saved is None:
+                saved = action_dump(client, attempt, output)
+            if not args.verify:
+                return saved
+            # A dropped verification read may reconnect, but never redump over
+            # the completed backup or silently compare against a different chip.
+            if client.jedec_id.hex() != saved["jedec"] or client.capacity != saved["capacity"]:
+                raise ApxError("flash identity/capacity changed while verifying the saved backup")
+            image = output.read_bytes()
+            if hashlib.sha256(image).hexdigest() != saved["sha256"]:
+                raise ApxError("saved backup changed before verification")
+            verified = action_verify(client, attempt, image)
+            try:
+                _write_new_file(verification_path(output), (json.dumps(verified, indent=2) + "\n").encode())
+            except OSError as exc:
+                raise ApxError(f"could not save verification report: {exc}; backup is preserved at {output}") from exc
+            return {"dump": saved, "verification": verified}
+
+        result = run_when_caught(capture, **common)
+        print(json.dumps(result, indent=2))
+        return 0 if not args.verify or result["verification"]["verified"] else 2
+    if args.rescue_command == "verify":
+        image = args.input.expanduser().read_bytes()
+        if len(image) not in (0x200000, 0x400000):
+            raise ValueError("verification image must be exactly 2 or 4 MiB (matching the detected chip)")
+        result = run_when_caught(lambda c, n: action_verify(c, n, image), **common)
+        print(json.dumps(result, indent=2))
+        return 0 if result["verified"] else 2
     # restore: validate everything locally before touching the device.
     if not args.yes:
         raise ApxError("restore erases and reprograms flash; pass --yes to confirm")
