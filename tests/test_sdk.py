@@ -157,3 +157,44 @@ def test_jpeg_reclaim_backs_up_and_restores_before_takeover(manifest):
   assert write.call_args_list[-1].args[1:]==(JPEG_RESERVATION[0],original)
  backup=list(path.parent.glob('jpeg-ram-before-*.bin'));assert len(backup)==1 and backup[0].read_bytes()==original
  metadata=json.loads(backup[0].with_suffix('.json').read_text());assert metadata['sha256']==hashlib.sha256(original).hexdigest()
+
+def _launch_with_low_window(manifest,reads,**options):
+ from apxtool.sdk import LOW_RESERVATION
+ path,document=manifest;document['reservations']=RESERVATIONS+[LOW_RESERVATION];path.write_text(json.dumps(document))
+ device=FakeDevice()
+ with patch('apxtool.sdk.scsi_port',return_value='7-1'),patch('apxtool.sdk.enter_loader_with_device',return_value=('/dev/sg0',device,None)),\
+      patch('apxtool.sdk.read_ram',side_effect=lambda *a:next(reads)),patch('apxtool.sdk.write_ram_experimental') as write,\
+      patch.object(device,'execute') as execute:
+  try:launch('/dev/sg0',path,**options)
+  except Exception as error:caught=error
+  else:caught=None
+ return path,device,write,execute,caught
+
+def test_low_application_window_is_a_reservation_and_occupied_ram_is_refused(manifest):
+ from apxtool.sdk import LOW_RESERVATION
+ occupied=bytes([5])*LOW_RESERVATION[1]
+ for options in ({},{'reclaim_jpeg_ram':True}): # the JPEG flag must not unlock this window
+  reads=iter([bytes(0x20000),bytes(0x1000),occupied,bytes(0x20000),bytes(0x1000)]) # the last two verify the restore of the earlier windows
+  path,device,write,execute,caught=_launch_with_low_window(manifest,reads,**options)
+  assert isinstance(caught,UnsafeOperation) and '0x2080000' in str(caught)
+  execute.assert_not_called();assert device.closed
+  assert write.call_count==2 and all(call.args[1]!=LOW_RESERVATION[0] for call in write.call_args_list) # only the zero windows are restored; the occupied one is never written
+  assert not list(path.parent.glob('low-ram-before-*'))
+
+def test_low_reclaim_backs_up_and_restores_before_takeover(manifest):
+ from apxtool.sdk import LOW_RESERVATION
+ original=bytes([17])*LOW_RESERVATION[1]
+ reads=iter([bytes(0x20000),bytes(0x1000),original,bytes(LOW_RESERVATION[1]),b'wrong',bytes(0x20000),bytes(0x1000),original])
+ path,device,write,execute,caught=_launch_with_low_window(manifest,reads,reclaim_low_ram=True)
+ assert isinstance(caught,ApxError) and 'upload readback' in str(caught)
+ execute.assert_not_called();assert device.closed
+ assert write.call_args_list[-1].args[1:]==(LOW_RESERVATION[0],original) # the stock RAM image is put back
+ backup=list(path.parent.glob('low-ram-before-*.bin'));assert len(backup)==1 and backup[0].read_bytes()==original
+ metadata=json.loads(backup[0].with_suffix('.json').read_text());assert metadata['sha256']==hashlib.sha256(original).hexdigest()
+
+def test_low_window_zero_preflight_passes_when_empty(manifest):
+ from apxtool.sdk import LOW_RESERVATION
+ reads=iter([bytes(0x20000),bytes(0x1000),bytes(LOW_RESERVATION[1]),b'wrong',bytes(0x20000),bytes(0x1000),bytes(LOW_RESERVATION[1])])
+ path,device,write,execute,caught=_launch_with_low_window(manifest,reads)
+ assert isinstance(caught,ApxError) and 'upload readback' in str(caught) # reached the upload: the empty window was accepted
+ assert not list(path.parent.glob('low-ram-before-*'))

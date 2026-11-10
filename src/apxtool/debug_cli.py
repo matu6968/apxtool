@@ -25,6 +25,7 @@ def configure(parser,sub):
     start.add_argument('manifest',type=Path,nargs='?',default=Path(__file__).resolve().parents[3]/'appotech-sdk/build/usb-debug.manifest.json')
     start.add_argument('--timeout',type=float,default=20)
     start.add_argument('--reclaim-jpeg-ram',action='store_true',help='back up and clear the fixed JPEG workspace if vendor RAM occupies it')
+    start.add_argument('--reclaim-low-ram',action='store_true',help='back up and clear the application-buffer window (0x02080000, 512 KiB) if vendor RAM occupies it, as when launching from stock firmware')
     start.add_argument('--stock-backup',type=Path,help='initialize DDR from forced BootROM using the verified Silvergear backup; RAM only')
     start.add_argument('--stage',type=Path,help='Silvergear SRAM stage binary')
     debug=sub.add_parser('debug',help='APXD vendor USB debugging')
@@ -171,7 +172,7 @@ def wait_bootrom(port,timeout=20,owned_ram=None):
 def run(args):
     if args.command=='sdk':
         if not args.device:raise ValueError('sdk launch requires --device /dev/sgN')
-        transport,info=launch(args.device,args.manifest,args.timeout,reclaim_jpeg_ram=args.reclaim_jpeg_ram,**({'stock_backup':args.stock_backup,'stage':args.stage} if args.stock_backup else {}))
+        transport,info=launch(args.device,args.manifest,args.timeout,reclaim_jpeg_ram=args.reclaim_jpeg_ram,reclaim_low_ram=args.reclaim_low_ram,**({'stock_backup':args.stock_backup,'stage':args.stage} if args.stock_backup else {}))
         try:print(json.dumps(info,indent=2))
         finally:transport.close()
         return 0

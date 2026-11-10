@@ -10,13 +10,18 @@ from .ram import read_ram,write_ram_experimental
 from .transport import require_complete
 
 RESERVATIONS=[[0x02180000,0x20000],[0x02200000,0x4000]]
-DISPLAY_RESERVATIONS=RESERVATIONS+[[0x02210000,0x10000]]
+DISPLAY_RESERVATION=[0x02210000,0x10000]
 FATFS_RESERVATION=[0x02220000,0xc0000]
-STORAGE_RESERVATIONS=RESERVATIONS+[FATFS_RESERVATION]
-DISPLAY_STORAGE_RESERVATIONS=DISPLAY_RESERVATIONS+[FATFS_RESERVATION]
+# The NOLOAD application buffers (.large_buffer) live in free DDR below the runtime window: 512 KiB from 0x02080000. The first 512 KiB of that
+# free DDR (0x02000000..0x0207ffff) is not reserved: the loader's own RAM-transfer scratch is at 0x02000000, and examples/usb-modes keeps its RAM disk there.
+LOW_RESERVATION=[0x02080000,0x80000]
 JPEG_RESERVATION=[0x022e0000,0x120000]
-BASE_RESERVATIONS=(RESERVATIONS,DISPLAY_RESERVATIONS,STORAGE_RESERVATIONS,DISPLAY_STORAGE_RESERVATIONS)
-ALLOWED_RESERVATIONS=BASE_RESERVATIONS+tuple(r+[JPEG_RESERVATION] for r in BASE_RESERVATIONS)
+# Optional windows, always listed in this order (the manifest tool and the SDK's own owned_ram report use it too).
+OPTIONAL_RESERVATIONS=(DISPLAY_RESERVATION,FATFS_RESERVATION,LOW_RESERVATION,JPEG_RESERVATION)
+ALLOWED_RESERVATIONS=tuple(RESERVATIONS+[window for bit,window in enumerate(OPTIONAL_RESERVATIONS) if mask>>bit&1] for mask in range(1<<len(OPTIONAL_RESERVATIONS)))
+DISPLAY_RESERVATIONS=ALLOWED_RESERVATIONS[1]
+STORAGE_RESERVATIONS=ALLOWED_RESERVATIONS[2]
+DISPLAY_STORAGE_RESERVATIONS=ALLOWED_RESERVATIONS[3]
 def scsi_port(path):
     for parent in (Path('/sys/class/scsi_generic')/Path(path).name/'device').resolve().parents:
         if (parent/'idVendor').exists():return parent.name
@@ -47,7 +52,7 @@ def load_manifest(path):
     if not any(segment.get('flags',1)&1 and segment['address']<=manifest['entry']<segment['address']+segment['bytes'] for segment in manifest['segments']):
         raise ValueError('entry is outside executable segments')
     return manifest,images
-def launch(device_path,manifest_path,timeout=20,*,reclaim_jpeg_ram=False,stock_backup=None,stage=None):
+def launch(device_path,manifest_path,timeout=20,*,reclaim_jpeg_ram=False,reclaim_low_ram=False,stock_backup=None,stage=None):
     manifest,images=load_manifest(manifest_path)
     if stock_backup is not None:
         if manifest.get('board')!='silvergear-3222882':raise ValueError('forced-ROM stage requires a Silvergear manifest')
@@ -61,19 +66,22 @@ def launch(device_path,manifest_path,timeout=20,*,reclaim_jpeg_ram=False,stock_b
         for address,length in manifest['reservations']:
             saved=read_ram(device,address,length)
             if any(saved):
-                if not reclaim_jpeg_ram or [address,length]!=JPEG_RESERVATION:
+                window=[address,length]
+                # Only the fixed JPEG arena and the low application-buffer window may be reclaimed, and only when asked for: vendor RAM
+                # (the stock firmware's image) occupies them when launching from stock mode. Other SDK reservations retain strict zero preflight.
+                name=('JPEG' if reclaim_jpeg_ram and window==JPEG_RESERVATION else 'low' if reclaim_low_ram and window==LOW_RESERVATION else None)
+                if name is None:
                     raise UnsafeOperation(f'SDK reservation at {address:#x} is occupied')
-                # Reclaim only the fixed JPEG arena, after making a recoverable
-                # copy. Other SDK reservations retain strict zero preflight.
+                # Make a recoverable copy first.
                 import time
-                backup=Path(manifest_path).resolve().with_name(f'jpeg-ram-before-{time.time_ns()}.bin')
+                backup=Path(manifest_path).resolve().with_name(f'{name.lower()}-ram-before-{time.time_ns()}.bin')
                 with backup.open('xb') as output:output.write(saved)
                 metadata={'address':address,'bytes':length,'sha256':hashlib.sha256(saved).hexdigest(),
                           'port':port,'build_id':manifest['build_id']}
                 backup.with_suffix('.json').write_text(json.dumps(metadata,indent=2)+'\n')
                 originals.append((address,saved))
                 write_ram_experimental(device,address,bytes(length))
-                if any(read_ram(device,address,length)):raise ApxError('JPEG RAM reclaim readback mismatch')
+                if any(read_ram(device,address,length)):raise ApxError(f'{name} RAM reclaim readback mismatch')
             else:originals.append((address,saved))
         for address,data in images:
             write_ram_experimental(device,address,data)

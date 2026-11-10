@@ -210,6 +210,16 @@ Replace the port/path with the current device. From a fresh boot,
 beside the manifest before clearing it. Other RAM reservations still require
 zero preflight; cleanup stops at takeover. The sample uses a native 220×176
 NV21 pattern scaled in hardware; the current encoder rejects downscaling.
+
+**Application-buffer window (`0x02080000`, 512 KiB).** Images that keep NOLOAD application buffers (camera previews, the image decoder's planes and
+scratch, audio and microphone workspaces, the SPI flash bounce buffer, LVGL and framebuffer arrays) place them there, in free DDR below the runtime
+window, so they no longer compete with code and tables for the extra bank. It is an ordinary reservation: it must be zero before a launch, and the host
+zeroes it with the other owned windows when the SDK hands back to the loader (`debug bootrom`), so repeated launches need nothing special. The one
+exception is a camera whose low DDR holds something else, which is the case after booting an *older-layout* SPI image (its boot-time DDR test leaves
+garbage there) or when launching from stock firmware. Then the launch is refused with `SDK reservation at 0x2080000 is occupied`; add
+`--reclaim-low-ram` to back it up beside the manifest (`low-ram-before-*.bin`, 512 KiB) and clear it, exactly as `--reclaim-jpeg-ram` does for the codec
+workspace. After booting an SPI image built with this layout the SDK clears the window itself and the flag is not needed. Note that the DOOM port's
+`tools/launch.sh` runs its own vendored copy of apxtool, which predates this window and rejects such manifests until that copy is updated.
 See [SDK JPEG usage](https://github.com/matu6968/appotech-sdk/blob/main/README.md#hardware-jpeg) and
 [hardware evidence](https://github.com/matu6968/appotech-sdk/blob/main/research/jpeg.md).
 
